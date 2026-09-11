@@ -99,3 +99,25 @@ jobs:
             echo "FAIL: HttpRemoteServer was stripped by R8"
             exit 1
           fi
+
+      - name: Report APK signature and package
+        run: |
+          cd src
+          APK=app/build/outputs/apk/default/release/app-default-release.apk
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          echo "--- apksigner: $APKSIGNER ---"
+          "$APKSIGNER" verify --print-certs "$APK" | head -12
+          AAPT=$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+          echo "--- package name ---"
+          "$AAPT" dump packagename "$APK" || true
+
+      # Signed with the throwaway key generated above, so it installs directly. The key is
+      # regenerated on every run, hence the signature differs run to run: uninstall a build
+      # from a previous run first, and also any Play/GitHub release build of the same id.
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: btremote-http-verify-apk
+          path: src/app/build/outputs/apk/default/release/app-default-release.apk
+          if-no-files-found: error
+          retention-days: 14

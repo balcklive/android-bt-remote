@@ -97,8 +97,9 @@ curl -X POST -H 'Content-Type: application/json' \
 {"ok":true,"hidConnected":true,"deviceName":"DESKTOP-XXXX","state":2,"port":8080,"apiVersion":1}
 ```
 
-`hidConnected` 为 `true` 表示已连上主机，可以开始发按键。为 `false` 时所有 `/key/*` 会返回
-`409 not_connected`。
+`hidConnected` 为 `true` 表示已连上主机，可以开始发按键。为 `false` 时 `/key/tap` 与 `/key/down`
+返回 `409 not_connected`；而 `/key/up` 和 `/key/release_all` **仍返回 `200`**——断线时更要能自救，
+所以这两个端点不做连接检查。
 
 ### 2. 查手机 IP
 
@@ -120,7 +121,7 @@ adb forward tcp:8080 tcp:8080
 ### 4. 发第一个按键
 
 ```bash
-# 注意 -H：服务强制要求 application/json，否则返回 415
+# 注意 -H：curl 的 -d 默认发 application/x-www-form-urlencoded，会被拒为 415
 curl -X POST -H 'Content-Type: application/json' \
      -d '{"key":"H"}' http://192.168.1.100:8080/key/tap
 ```
@@ -130,7 +131,9 @@ curl -X POST -H 'Content-Type: application/json' \
 ## API 参考
 
 基址 `http://<手机IP>:8080`，所有响应为 `application/json; charset=utf-8`。
-**所有 `/key/*` 请求必须带 `Content-Type: application/json`**，且**只接受 POST**。
+**所有 `/key/*` 只接受 POST**；`Content-Type` 的实际判定是「只要带了该头，就必须含 `json`」
+（大小写不敏感）：`application/x-www-form-urlencoded`、`text/plain` 一律 `415`，
+**完全不发 `Content-Type` 头则放行**。curl 的 `-d` 默认发前者，所以必须显式加 `-H`。
 
 ### `GET /` — 端点清单
 
@@ -314,10 +317,10 @@ body 可为 `{}`。幂等：
 | `400` | `empty_report` | `key` 和 `modifiers` 都没给，报文是空的 |
 | `404` | `not_found` | 路径不存在 |
 | `405` | `method_not_allowed` | 方法不对（`/key/*` 只收 POST） |
-| `409` | `not_connected` | 没有已连接的蓝牙 HID 主机 |
+| `409` | `not_connected` | 没有已连接的蓝牙 HID 主机。**仅 `/key/tap`、`/key/down` 会返回** |
 | `409` | `key_already_down` | 已有键被按住（先 `/key/up`） |
 | `413` | `body_too_large` | body 超过 4096 字节 |
-| `415` | `unsupported_media_type` | `Content-Type` 不是 JSON |
+| `415` | `unsupported_media_type` | 带了 `Content-Type` 但不含 `json` |
 | `500` | `internal_error` | 兜底异常。**出现 500 说明有异常逃逸，请附日志反馈** |
 | `502` | `hid_write_failed` | 已连接但 HID 报文发送失败 |
 | `503` | `busy` | 并发请求超过 8 个 |
@@ -359,9 +362,20 @@ body 可为 `{}`。幂等：
 > 改成标准的 8 字节 6KRO 布局在技术上可行，但要同步改造 17 个虚拟键盘布局文件里约 2000 处
 > 内联字节字面量，且描述符改错会导致主机直接拒绝配对。当前未做。
 
-### 2. 修饰键不能在按住期间改变
+### 2. 按住期间不能发第二条报文
 
-`/key/down` 期间无法追加或改变修饰键——新报文会覆盖住已按下的键。
+`/key/down` 生效后 `held` 互锁置位，此后任何 `/key/tap` 或 `/key/down` 都被拒为
+`409 key_already_down`——既不能追加修饰键，也不能换一个键。必须先 `/key/up`
+（或等看门狗超时）才能发下一条。
+
+注意区分两种"忙"：
+
+- **`/key/down` 期间**：锁已释放，`held` 负责拦截 → 并发请求**立刻**拿到 `409`
+- **`/key/tap` 带 `hold` 期间**：长按的整个时长都在持锁 → 并发请求**阻塞排队**，
+  等这次长按结束才执行，不会返回 `409`
+
+所以一次 `hold:5000` 的请求会让同时到达的另一个请求干等约 5 秒。`/status` 不碰这把锁，
+**永远秒回**，适合做健康探测。
 
 ### 3. 服务生命周期取决于应用状态
 
@@ -374,9 +388,11 @@ body 可为 `{}`。幂等：
 
 客户端需要区分「端口连不上」（应用没运行）和「`409 not_connected`」（应用在跑但没配对主机）。
 
-### 4. 必须已连接主机才能操作
+### 4. 只有动作类端点需要已连接主机
 
-`/key/*` 在未连接时一律返回 `409 not_connected`，不会排队等待。
+`/key/tap` 和 `/key/down` 在未连接时返回 `409 not_connected`，**不会排队等待**，蓝牙恢复后也不会
+补发。`/key/up` 和 `/key/release_all` 不做连接检查，未连接时照样返回 `200`——它们的职责是
+"确保没有任何键被按住"，断线时这个语义依然成立。
 
 ### 5. 主机输入法状态会影响输出
 
@@ -413,8 +429,9 @@ body 可为 `{}`。幂等：
 
 已内置的两道缓解（**不足以替代鉴权**）：
 
-1. 强制 `Content-Type: application/json`。表单和 `text/plain` 属于 CORS 安全列表类型，
-   浏览器可以跨域直接发送；挡掉它们能阻止网页表单类的 CSRF。
+1. 拒绝 `Content-Type` 不含 `json` 的请求。表单和 `text/plain` 属于 CORS 安全列表类型，
+   浏览器可以跨域直接发送而无需 preflight；挡掉它们能阻止网页表单类的 CSRF。
+   （不带 `Content-Type` 的裸请求会被放行，但那只影响手写请求——浏览器发起的跨域请求必带该头。）
 2. **不返回任何 CORS 头**。跨域 JSON 请求会先发 preflight，而我们不响应 CORS 头，
    preflight 失败，恶意网页无法利用。
    **不要在未加鉴权的情况下添加 `Access-Control-Allow-Origin: *`**，那会拆掉这道防线。
@@ -432,7 +449,8 @@ body 可为 `{}`。幂等：
 |---|---|
 | 连接被拒绝 | 应用没运行，或没进入设备选择界面 |
 | `/status` 返回 `hidConnected:false` | 蓝牙未配对/未连接目标主机 |
-| 所有 `/key/*` 返回 `415` | 忘了 `-H 'Content-Type: application/json'` |
+| `/key/*` 返回 `415` | `Content-Type` 不含 `json`。curl 的 `-d` 默认发表单类型，加 `-H 'Content-Type: application/json'` |
+| `/key/up` 返回 `200` 但似乎没释放 | 本来就没有键按住，`"released":false` 不是错误 |
 | 返回 `409 key_already_down` | 有键被按住，先 `/key/up` 或 `/key/release_all` |
 | 发出按键但主机无反应 | 主机输入法在组词模式；或主机焦点不在目标窗口 |
 | 部分按键丢失 | 点按太短。主机侧有丢帧，重试或改用 `/key/down` + 延迟 + `/key/up` |

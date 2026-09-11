@@ -1,0 +1,123 @@
+name: Verify Build (temporary)
+
+# TEMPORARY verification workflow. It exists only to answer "does patch 0004 compile,
+# and does R8 keep NanoHTTPD?". It is not part of the release pipeline - apk.yml is.
+#
+# It differs from apk.yml in one way: instead of the STORE/LOCAL signing secrets it
+# generates a throwaway keystore with keytool, so it can run on a fork that has no
+# secrets configured. R8/minification is identical either way, so the release-only
+# ProGuard rules are still genuinely exercised.
+
+on:
+  push:
+    branches:
+      - "ci-verify"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Use JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "21"
+          cache: "gradle"
+
+      - name: Patch
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          chmod +x ./build.sh ./src/gradlew
+          ./build.sh
+          echo "--- applied commits ---"
+          git -C src log --oneline -6
+
+      - name: Throwaway signing key
+        run: |
+          cd src
+          keytool -genkeypair -v -keystore upload.jks -alias ci \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass cipassword -keypass cipassword \
+            -dname "CN=CI, OU=CI, O=CI, L=CI, S=CI, C=US"
+          cat > local.properties <<'EOF'
+          storeFile=../upload.jks
+          storePassword=cipassword
+          keyAlias=ci
+          keyPassword=cipassword
+          EOF
+          echo "--- local.properties ---"
+          cat local.properties
+
+      - name: Confirm nanohttpd resolves
+        run: |
+          cd src
+          ./gradlew :app:dependencies --configuration defaultReleaseRuntimeClasspath \
+            | grep -i nanohttpd || echo "!! nanohttpd not found in the release runtime classpath"
+
+      - name: Assemble release (compiles + runs R8)
+        run: |
+          cd src
+          ./gradlew assembleDefaultRelease --stacktrace
+
+      # The whole point of the release build: prove the -keep rules survived R8.
+      # If fi/iki/elonen is absent here, the keep rule is wrong and the app would
+      # throw NoClassDefFoundError at runtime, in release builds only.
+      - name: Verify R8 kept NanoHTTPD
+        run: |
+          set -euo pipefail
+          cd src
+          APK=app/build/outputs/apk/default/release/app-default-release.apk
+          echo "--- apk ---"
+          ls -la "$APK"
+
+          rm -rf /tmp/apk && mkdir -p /tmp/apk
+          unzip -o -q "$APK" -d /tmp/apk
+          echo "--- dex files ---"
+          ls -la /tmp/apk/*.dex
+
+          if strings /tmp/apk/*.dex | grep -q 'Lfi/iki/elonen/NanoHTTPD;'; then
+            echo "OK: R8 kept fi.iki.elonen.NanoHTTPD"
+            echo "--- retained elonen classes (sample) ---"
+            strings /tmp/apk/*.dex \
+              | grep -o 'Lfi/iki/elonen/NanoHTTPD[^;]*;' \
+              | sort -u | head -25
+          else
+            echo "FAIL: NanoHTTPD was stripped by R8 - the -keep rules are wrong"
+            exit 1
+          fi
+
+          if strings /tmp/apk/*.dex | grep -q 'Lcom/atharok/btremote/presentation/http/HttpRemoteServer;'; then
+            echo "OK: R8 kept HttpRemoteServer"
+          else
+            echo "FAIL: HttpRemoteServer was stripped by R8"
+            exit 1
+          fi
+
+      - name: Report APK signature and package
+        run: |
+          cd src
+          APK=app/build/outputs/apk/default/release/app-default-release.apk
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          echo "--- apksigner: $APKSIGNER ---"
+          "$APKSIGNER" verify --print-certs "$APK" | head -12
+          AAPT=$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+          echo "--- package name ---"
+          "$AAPT" dump packagename "$APK" || true
+
+      # Signed with the throwaway key generated above, so it installs directly. The key is
+      # regenerated on every run, hence the signature differs run to run: uninstall a build
+      # from a previous run first, and also any Play/GitHub release build of the same id.
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: btremote-http-verify-apk
+          path: src/app/build/outputs/apk/default/release/app-default-release.apk
+          if-no-files-found: error
+          retention-days: 14

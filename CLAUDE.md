@@ -55,6 +55,8 @@
    `git am --whitespace=nowarn --keep-non-patch <仓库>/patches/*.patch` →
    `git rev-parse HEAD^{tree}` 应与 `git -C src rev-parse http-remote^{tree}` **逐字节相同** →
    `git -C src worktree remove /tmp/pv --force`
+   **但它只证明补丁能干净应用，不证明能编译**——本机没装 java/gradle 时，Kotlin 改动的编译正确性
+   只能靠 CI 或另一台有 Android SDK 的机器兜底。别把"tree 哈希一致"当成"编译通过"。
 
 **顺序恒为：改 → commit → `generate.sh` →（可选）`build.sh`。绝不能先 `build.sh` 再 `generate.sh`**——
 `build.sh` 的 `sed -i` 会就地修改子模块工作树，若之后 `git add -A`，这些构建期改写会被污染进补丁。
@@ -70,8 +72,13 @@
 - **`generate.sh` 复现不出原始补丁的排版**。现有的 `0001`–`0003` 是 1 行上下文（`-U1`），
   而 `git format-patch` 默认 3 行上下文并会合并相邻 hunk。重跑 `generate.sh` 会让这三个文件
   出现纯排版差异（blob 哈希不变，功能等价）。**新补丁只提交自己那一个，不要顺带重写无关补丁。**
+  实测确认：重跑后**只有 `0001`–`0003` 会变**，`0004` 逐字节相同（它本来就是 `generate.sh` 生成的），
+  所以生成完直接 `git checkout -- patches/0001* patches/0002* patches/0003*` 还原即可。
 - **新增补丁必须零填充命名**（`0004-`、`0005-`…）。`build.sh` 靠 shell 通配符展开，字典序即应用顺序。
   补丁的 diff 上下文依赖它前面所有补丁已应用，因此不能重排、不能改名、不能删中间某个。
+- **`patches/*.patch` 在仓库里是 CRLF 存储的**（`core.autocrlf=true` 的产物，`0001`–`0004` 全都如此），
+  CI 在 Linux 上 check out 后由 `git am --whitespace=nowarn` 正常应用——已实测。**不要"顺手"把它们
+  转成 LF**，没有理由，只会引入一个巨大的无意义 diff。
 - **`build.sh` 不能连跑两次**：第二次 `git am` 会发现补丁已应用而报错。重测前先 reset 到基线。
 - **版本号硬编码在 `build.sh` 顶部**（`VERSION_CODE` / `VERSION_NAME`）。git tag 只用于命名
   GitHub Release，**不影响 APK 内的版本号**。要改 APK 版本必须改 `build.sh`。

@@ -391,6 +391,19 @@ for ch in "hello":
 > Nagle 必须放行，实测 0–1 ms；同一个 `/status` 则是 48–110 ms。）无线电、AP、手机 CPU 都不认识
 > MSS，只有 Nagle 认识。
 
+**怎么测延迟（以及会骗你的东西）：**
+
+- **分腿测**，用 `curl --trace-time --trace-ascii -`：`Request completely sent off` → `Recv header` 是
+  单程，`Recv header` → `Recv data` 是响应写出。带 body 的请求，curl 说的是
+  `upload completely sent off`，不是 `Request completely sent off`。
+- **别用 `%{num_connects}` 判断连接有没有复用**。实测在 `-K` 多 URL 场景下它恒为 1，会让人误判成
+  「每个请求都新建了连接」。看 `curl -v` 的 `Reusing existing http: connection`。
+- **别拿 `ping` 当延迟基线**。手机常降级处理 ICMP：同一 WiFi 下实测 ICMP RTT 均值 91 ms，而 TCP
+  单程只有 7–41 ms。ping 用来看**丢包和抖动**，不用来看绝对延迟。
+- **判 Nagle 必须靠对照，不能靠绝对值**。delayed ACK 定时器随客户端 OS 变化（Linux ~40 ms、
+  Windows 200 ms 档），所以「怎么不是 40 ms」不能用来否定 Nagle；而链路抖动会轻易把它埋掉。
+  唯一可靠的判据就是上面那个 MSS 对照。
+
 **用连接池要留意三件事：**
 
 1. **空闲超过 5 秒会被服务端单方面断开**。服务端给每条连接设的读超时是

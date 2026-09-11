@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pf <xiaofei450@126.com>
+Date: Sat, 12 Sep 2026 01:17:50 +0800
+Subject: [PATCH] Turn off Nagle on HTTP client sockets
+
+Response.send() writes a response in two goes - it flushes the header block, then
+sendBody() writes the body to the raw socket stream - and both writes are below one
+MSS. nanohttpd never sets TCP_NODELAY, so Nagle withholds the body until the peer's
+delayed ACK arrives.
+
+Measured from a Windows client against this server:
+  - every response paid 48-110 ms between the header segment and the body segment
+  - a response body larger than MSS, which Nagle is obliged to let through,
+    arrived in 0-1 ms
+
+That contrast is what identifies the stall as Nagle rather than the network.
+createClientHandler() is the only hook that can reach the accepted socket, because
+nanohttpd builds it inside ServerRunnable.
+
+diff --git a/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
+index 360c367..ac2d1b5 100644
+--- a/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
++++ b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
+@@ -33,6 +33,8 @@ import kotlinx.serialization.json.jsonObject
+ import kotlinx.serialization.json.longOrNull
+ import kotlinx.serialization.json.put
+ import java.io.IOException
++import java.io.InputStream
++import java.net.Socket
+ import java.util.concurrent.atomic.AtomicInteger
+ 
+ /**
+@@ -118,6 +120,33 @@ class HttpRemoteServer(
+         }
+     }
+ 
++    // ---- Socket options ----
++
++    /**
++     * Turns off Nagle on every accepted connection.
++     *
++     * [Response.send] writes a response in two goes: it flushes the header block, then
++     * `sendBody` writes the body straight to the raw socket stream that `ClientHandler` took
++     * from `acceptSocket.getOutputStream()`. Both writes are below one MSS, so with Nagle on
++     * the second is withheld until the peer acknowledges the first - and that peer answers
++     * with a delayed ACK, tens of milliseconds later. Measured against this server from a
++     * Windows client, every response paid 48-110 ms that way, while a response body larger
++     * than MSS (which Nagle is obliged to let through) arrived in 0-1 ms. The stall is Nagle,
++     * not the network.
++     *
++     * nanohttpd never sets TCP_NODELAY, and it builds the socket inside `ServerRunnable`, so
++     * this hook is the only place that can reach it. The call is wrapped because a failure
++     * here must not cost us the response - the API keeps working either way.
++     */
++    override fun createClientHandler(finalAccept: Socket, inputStream: InputStream): ClientHandler {
++        try {
++            finalAccept.tcpNoDelay = true
++        } catch (e: Exception) {
++            Log.w(HTTP_LOG_TAG, "Could not set TCP_NODELAY on an HTTP client socket", e)
++        }
++        return super.createClientHandler(finalAccept, inputStream)
++    }
++
+     // ---- Request entry point ----
+ 
+     override fun serve(session: IHTTPSession): Response {

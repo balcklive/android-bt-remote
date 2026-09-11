@@ -20,7 +20,7 @@
 | `fastlane/` | F-Droid 上架元数据（描述、截图） |
 | `.github/workflows/apk.yml` | CI：打补丁 → Gradle 构建 → 发 GitHub Release |
 | `README.md` | 面向用户的说明。HTTP API 一节只留摘要，细节链接到 `docs/API.md` |
-| `docs/API.md` | HTTP 远程输入微服务的**完整接口文档**（对应补丁 `0004`）。描述的是**行为**，不在补丁 diff 里 |
+| `docs/API.md` | HTTP 远程输入微服务的**完整接口文档**（对应补丁 `0004`、`0005`）。描述的是**行为**，不在补丁 diff 里 |
 | `LICENSE` | GPLv3 |
 
 ## 调用链
@@ -49,7 +49,12 @@
 3. **先自查基线**：`git merge-base origin/main HEAD` 必须仍是上游基线提交，
    `git log --oneline <基线>..HEAD` 必须正好是「现有补丁数 + 1」个提交
 4. 回到仓库根目录运行 `./generate.sh`
-5. 可选：`git checkout -B build-loop <基线>` 后跑 `./build.sh` 验证整个补丁栈能干净应用
+5. 可选：`git checkout -B build-loop <基线>` 后跑 `./build.sh` 验证整个补丁栈能干净应用。
+   没装 gradle 时用 worktree 等效验证（不动当前 HEAD，也不需要 Android SDK）：
+   `git -C src worktree add --detach /tmp/pv <基线>` → 在 `/tmp/pv` 里
+   `git am --whitespace=nowarn --keep-non-patch <仓库>/patches/*.patch` →
+   `git rev-parse HEAD^{tree}` 应与 `git -C src rev-parse http-remote^{tree}` **逐字节相同** →
+   `git -C src worktree remove /tmp/pv --force`
 
 **顺序恒为：改 → commit → `generate.sh` →（可选）`build.sh`。绝不能先 `build.sh` 再 `generate.sh`**——
 `build.sh` 的 `sed -i` 会就地修改子模块工作树，若之后 `git add -A`，这些构建期改写会被污染进补丁。

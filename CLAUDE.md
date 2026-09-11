@@ -19,7 +19,8 @@
 | `res/` | 资源覆盖层，按路径合并进 `src/app/src/main/res/`（同名文件覆盖） |
 | `fastlane/` | F-Droid 上架元数据（描述、截图） |
 | `.github/workflows/apk.yml` | CI：打补丁 → Gradle 构建 → 发 GitHub Release |
-| `README.md` | 面向用户的说明 |
+| `README.md` | 面向用户的说明。HTTP API 一节只留摘要，细节链接到 `docs/API.md` |
+| `docs/API.md` | HTTP 远程输入微服务的**完整接口文档**（对应补丁 `0004`）。描述的是**行为**，不在补丁 diff 里 |
 | `LICENSE` | GPLv3 |
 
 ## 调用链
@@ -69,6 +70,19 @@
 - **`build.sh` 不能连跑两次**：第二次 `git am` 会发现补丁已应用而报错。重测前先 reset 到基线。
 - **版本号硬编码在 `build.sh` 顶部**（`VERSION_CODE` / `VERSION_NAME`）。git tag 只用于命名
   GitHub Release，**不影响 APK 内的版本号**。要改 APK 版本必须改 `build.sh`。
+
+### 文档与代码的一致性
+
+`docs/API.md` 描述的是**运行时行为**——状态码、钳制范围、并发排队语义、服务生命周期。
+这类信息**在补丁 diff 里看不出来**，所以改动 `src` 里的 HTTP 服务后必须回来同步更新它，
+否则文档会静默偏离实现。本仓库已经发生过一次：README 曾声称「所有 `/key/*` 未连接都返回
+`409 not_connected`」「必须带 `Content-Type: application/json`」，两处均与代码不符。
+
+权威实现是这三个文件（详见 `docs/CLAUDE.md`）：
+
+- `presentation/http/HttpRemoteServer.kt` — 路由、状态码、上限、Content-Type 判定
+- `domain/usecases/HttpKeyboardUseCase.kt` — Mutex、`held` 互锁、看门狗
+- `domain/entities/remoteInput/keyboard/KeyboardKeyNames.kt` — 键名与修饰键名表
 
 ### CI
 

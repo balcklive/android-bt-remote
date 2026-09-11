@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pf <xiaofei450@126.com>
+Date: Sat, 12 Sep 2026 01:22:58 +0800
+Subject: [PATCH] Correct the in-flight comment: one thread per connection, not
+ per request
+
+NanoHTTPD's DefaultAsyncRunner spawns a thread per accepted socket
+(ServerRunnable calls asyncRunner.exec() once per accept), and with keep-alive
+that thread goes on to serve every request on that connection. The comment
+claimed per request, which understates how long a thread lives and why the
+in-flight cap is on requests rather than on connections.
+
+diff --git a/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
+index ac2d1b5..95679d9 100644
+--- a/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
++++ b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
+@@ -64,7 +64,12 @@ class HttpRemoteServer(
+ 
+     private val json = Json { ignoreUnknownKeys = true }
+ 
+-    /** NanoHTTPD's async runner spawns a thread per request with no cap of its own. */
++    /**
++     * NanoHTTPD's async runner caps nothing: it spawns one thread per accepted connection, not
++     * per request, and a keep-alive connection holds its thread until the client stops sending
++     * (an idle one is reaped by the 5 s read timeout). This counts requests in flight, which is
++     * what the endpoints actually contend for.
++     */
+     private val inFlight = AtomicInteger(0)
+ 
+     /**

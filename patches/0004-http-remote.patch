@@ -332,10 +332,10 @@ index 0000000..047048a
 +}
 diff --git a/app/src/main/java/com/atharok/btremote/domain/usecases/HttpKeyboardUseCase.kt b/app/src/main/java/com/atharok/btremote/domain/usecases/HttpKeyboardUseCase.kt
 new file mode 100644
-index 0000000..5a7e848
+index 0000000..fbc4896
 --- /dev/null
 +++ b/app/src/main/java/com/atharok/btremote/domain/usecases/HttpKeyboardUseCase.kt
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,210 @@
 +package com.atharok.btremote.domain.usecases
 +
 +import android.bluetooth.BluetoothProfile
@@ -393,8 +393,24 @@ index 0000000..5a7e848
 +
 +    private val mutex = Mutex()
 +
-+    /** The non-modifier key currently held by the HTTP session. Guarded by [mutex]. */
-+    private var held: KeyboardKey? = null
++    /**
++     * A key and modifier bitmap held down as a single HID report.
++     *
++     * [key] is null when only modifiers are held. That is a legitimate report
++     * (`[modifiers, 0x00]`) and is how a client taps Win on its own or holds Ctrl by itself,
++     * so [held] being non-null - not [key] - is what marks a report as in flight.
++     */
++    private data class HeldReport(val key: KeyboardKey?, val modifiers: Byte)
++
++    /** The report currently held by the HTTP session. Guarded by [mutex]. */
++    private var held: HeldReport? = null
++
++    /**
++     * Bumped whenever a hold is armed or cleared. The watchdog captures its value, so a key
++     * released and re-pressed before the old timer fires cannot have the *new* hold released
++     * by the stale one.
++     */
++    private var holdToken: Long = 0L
 +
 +    private var watchdog: Job? = null
 +
@@ -427,14 +443,17 @@ index 0000000..5a7e848
 +     * A zero (or tiny) hold is clamped up to the pacing the app already uses when sending
 +     * text, because some hosts drop presses that are too short. Holding a key down makes the
 +     * *host* auto-repeat it; no repeated reports are sent from here.
++     *
++     * A null [key] presses [modifiers] on their own - the way a client taps Win alone, or
++     * holds Ctrl with nothing else down.
 +     */
-+    suspend fun tap(key: KeyboardKey, modifiers: Byte, holdMillis: Long): KeyResult =
++    suspend fun tap(key: KeyboardKey?, modifiers: Byte, holdMillis: Long): KeyResult =
 +        mutex.withLock {
 +            if (!isConnected()) return KeyResult.NotConnected
 +            if (held != null) return KeyResult.AlreadyDown
 +            if (!write(pressReport(key, modifiers))) return KeyResult.WriteFailed
 +
-+            held = key
++            held = HeldReport(key, modifiers)
 +            try {
 +                delay(holdMillis.coerceIn(DELAY_BETWEEN_KEY_PRESSES_IN_MILLIS, HTTP_MAX_HOLD_MILLIS))
 +                KeyResult.Ok()
@@ -452,15 +471,17 @@ index 0000000..5a7e848
 +     * The lock is only held for the state transition, not for the caller-controlled hold.
 +     * [held] then acts as the interlock: a second [keyDown] or a [tap] both see it and are
 +     * refused. [timeoutMillis] arms a watchdog that releases the key if the client vanishes.
++     *
++     * A null [key] holds [modifiers] on their own; see [tap].
 +     */
-+    suspend fun keyDown(key: KeyboardKey, modifiers: Byte, timeoutMillis: Long): KeyResult =
++    suspend fun keyDown(key: KeyboardKey?, modifiers: Byte, timeoutMillis: Long): KeyResult =
 +        mutex.withLock {
 +            if (!isConnected()) return KeyResult.NotConnected
 +            if (held != null) return KeyResult.AlreadyDown
 +            if (!write(pressReport(key, modifiers))) return KeyResult.WriteFailed
 +
-+            held = key
-+            armWatchdog(key, timeoutMillis)
++            held = HeldReport(key, modifiers)
++            armWatchdog(timeoutMillis)
 +            KeyResult.Ok()
 +        }
 +
@@ -488,9 +509,13 @@ index 0000000..5a7e848
 +
 +    // ---- Internals ----
 +
-+    /** A keyboard report is exactly two bytes: modifier bitmap, then one keycode. */
-+    private fun pressReport(key: KeyboardKey, modifiers: Byte): ByteArray =
-+        byteArrayOf(modifiers, key.byte)
++    /**
++     * A keyboard report is exactly two bytes: modifier bitmap, then one keycode.
++     *
++     * A zero keycode is the HID "no key" sentinel, so a null [key] sends a bare modifier press.
++     */
++    private fun pressReport(key: KeyboardKey?, modifiers: Byte): ByteArray =
++        byteArrayOf(modifiers, key?.byte ?: 0x00)
 +
 +    /**
 +     * Note: [REMOTE_INPUT_NONE] is shared with the consumer/remote report. Reusing the same
@@ -500,12 +525,13 @@ index 0000000..5a7e848
 +    private fun write(report: ByteArray): Boolean =
 +        bluetoothRepository.sendReport(KEYBOARD_REPORT_ID, report)
 +
-+    private fun armWatchdog(key: KeyboardKey, timeoutMillis: Long) {
++    private fun armWatchdog(timeoutMillis: Long) {
 +        cancelWatchdog()
++        val token = holdToken
 +        watchdog = scope.launch {
 +            delay(timeoutMillis.coerceIn(HTTP_MIN_KEYDOWN_MILLIS, HTTP_MAX_KEYDOWN_MILLIS))
 +            mutex.withLock {
-+                if (held == key) {
++                if (holdToken == token) {
 +                    write(REMOTE_INPUT_NONE)
 +                    held = null
 +                }
@@ -513,17 +539,19 @@ index 0000000..5a7e848
 +        }
 +    }
 +
++    /** Cancels any pending watchdog and invalidates its token, so it can never fire late. */
 +    private fun cancelWatchdog() {
++        holdToken++
 +        watchdog?.cancel()
 +        watchdog = null
 +    }
 +}
 diff --git a/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
 new file mode 100644
-index 0000000..0a5574f
+index 0000000..ba2c0e9
 --- /dev/null
 +++ b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,447 @@
 +package com.atharok.btremote.presentation.http
 +
 +import android.content.Context
@@ -730,17 +758,23 @@ index 0000000..0a5574f
 +        }.toString()
 +    )
 +
-+    /** Tap and long-press. `hold` is clamped; holding the key makes the host auto-repeat it. */
++    /**
++     * Tap and long-press. `hold` is clamped; holding the key makes the host auto-repeat it.
++     *
++     * `key` may be omitted when `modifiers` is not empty, which presses the modifiers alone.
++     */
 +    private fun handleTap(session: IHTTPSession): Response {
 +        val body = readBody(session) ?: return tooLargeResponse()
 +        val obj = parseObject(body) ?: return badJsonResponse()
 +
 +        val keyName = obj.stringField("key")
-+            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("missing_key", "Field 'key' is required"))
-+        val key = KeyboardKeyNames.lookup(keyName)
-+            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_key", "Unknown key: $keyName"))
++        val key = keyName?.let { KeyboardKeyNames.lookup(it) }
++        if (keyName != null && key == null) {
++            return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_key", "Unknown key: $keyName"))
++        }
 +        val modifiers = obj.modifierMask()
 +            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_modifier", "Unrecognised entry in 'modifiers'"))
++        if (key == null && modifiers.toInt() == 0) return emptyReportResponse()
 +
 +        val requestedHold = obj.longField("hold") ?: 0L
 +        val effectiveHold =
@@ -748,22 +782,28 @@ index 0000000..0a5574f
 +
 +        val result = runBlocking { useCase.tap(key, modifiers, requestedHold) }
 +        return resultResponse(result) {
-+            put("key", keyName)
++            if (keyName != null) put("key", keyName)
 +            put("hold", effectiveHold)
 +        }
 +    }
 +
-+    /** Press and leave held until `/key/up`. `timeout` arms the auto-release watchdog. */
++    /**
++     * Press and leave held until `/key/up`. `timeout` arms the auto-release watchdog.
++     *
++     * As with `/key/tap`, `key` may be omitted when `modifiers` is not empty.
++     */
 +    private fun handleDown(session: IHTTPSession): Response {
 +        val body = readBody(session) ?: return tooLargeResponse()
 +        val obj = parseObject(body) ?: return badJsonResponse()
 +
 +        val keyName = obj.stringField("key")
-+            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("missing_key", "Field 'key' is required"))
-+        val key = KeyboardKeyNames.lookup(keyName)
-+            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_key", "Unknown key: $keyName"))
++        val key = keyName?.let { KeyboardKeyNames.lookup(it) }
++        if (keyName != null && key == null) {
++            return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_key", "Unknown key: $keyName"))
++        }
 +        val modifiers = obj.modifierMask()
 +            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_modifier", "Unrecognised entry in 'modifiers'"))
++        if (key == null && modifiers.toInt() == 0) return emptyReportResponse()
 +
 +        val requestedTimeout = obj.longField("timeout") ?: HTTP_MAX_KEYDOWN_MILLIS
 +        val effectiveTimeout =
@@ -771,7 +811,7 @@ index 0000000..0a5574f
 +
 +        val result = runBlocking { useCase.keyDown(key, modifiers, requestedTimeout) }
 +        return resultResponse(result) {
-+            put("key", keyName)
++            if (keyName != null) put("key", keyName)
 +            put("autoReleaseInMillis", effectiveTimeout)
 +        }
 +    }
@@ -920,6 +960,13 @@ index 0000000..0a5574f
 +
 +    private fun badJsonResponse(): Response =
 +        jsonResponse(Status.BAD_REQUEST, errorBody("bad_json", "Body must be a JSON object"))
++
++    /** A report has to say *something*: either a key, or at least one modifier. */
++    private fun emptyReportResponse(): Response =
++        jsonResponse(
++            Status.BAD_REQUEST,
++            errorBody("empty_report", "Provide 'key', or at least one entry in 'modifiers'")
++        )
 +
 +    private fun methodNotAllowed(): Response =
 +        jsonResponse(

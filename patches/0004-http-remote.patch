@@ -1,0 +1,1047 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pf <xiaofei450@126.com>
+Date: Fri, 11 Sep 2026 12:02:46 +0800
+Subject: [PATCH] http remote
+
+
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 7a7f2b2..f934be9 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -106,6 +106,7 @@ dependencies {
+     implementation(libs.androidx.datastore)
+     implementation(libs.koin.androidx.compose)
+     implementation(libs.kotlinx.serialization.json)
++    implementation(libs.nanohttpd)
+     implementation(libs.glance.appwidget)
+     implementation(libs.glance.material3)
+     implementation(libs.androidx.work.runtime.ktx)
+diff --git a/app/proguard-rules.pro b/app/proguard-rules.pro
+index 481bb43..5dcca3c 100644
+--- a/app/proguard-rules.pro
++++ b/app/proguard-rules.pro
+@@ -18,4 +18,18 @@
+ 
+ # If you keep the line number information, uncomment this to
+ # hide the original source file name.
+-#-renamesourcefileattribute SourceFile
+\ No newline at end of file
++#-renamesourcefileattribute SourceFile
++
++# ---- NanoHTTPD (org.nanohttpd:nanohttpd) ----
++# Note: the artifact id is org.nanohttpd, but the classes ship in the legacy
++# fi.iki.elonen package (verified against nanohttpd-2.3.1.jar).
++# NanoHTTPD loads its MIME type tables from classpath resources
++# (META-INF/nanohttpd/default-mimetypes.properties, mimetypes.properties) and
++# instantiates its TempFileManagerFactory / AsyncRunner / ServerSocketFactory
++# chain reflectively, so R8 cannot see those edges. Keeping the whole library is
++# the cheap, correct remedy (~50 KB of dex).
++-keep class fi.iki.elonen.** { *; }
++-dontwarn fi.iki.elonen.**
++
++# Our own handler subclass, reached through Koin's inlined DSL.
++-keep class com.atharok.btremote.presentation.http.** { *; }
+\ No newline at end of file
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 498c507..085e367 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -27,6 +27,9 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+ 
++    <!-- Embedded HTTP remote input server (presentation/http/HttpRemoteServer.kt) -->
++    <uses-permission android:name="android.permission.INTERNET" />
++
+     <application
+         android:name=".BtRemoteApplication"
+         android:allowBackup="true"
+diff --git a/app/src/main/java/com/atharok/btremote/common/injections/Modules.kt b/app/src/main/java/com/atharok/btremote/common/injections/Modules.kt
+index 92ac541..346922a 100644
+--- a/app/src/main/java/com/atharok/btremote/common/injections/Modules.kt
++++ b/app/src/main/java/com/atharok/btremote/common/injections/Modules.kt
+@@ -60,8 +60,10 @@ import com.atharok.btremote.domain.usecases.BluetoothHidServiceUseCase
+ import com.atharok.btremote.domain.usecases.DeviceDiscoveryUseCase
+ import com.atharok.btremote.domain.usecases.DeviceSelectionUseCase
+ import com.atharok.btremote.domain.usecases.GyroscopeSensorUseCase
++import com.atharok.btremote.domain.usecases.HttpKeyboardUseCase
+ import com.atharok.btremote.domain.usecases.RemoteUseCase
+ import com.atharok.btremote.domain.usecases.SettingsUseCase
++import com.atharok.btremote.presentation.http.HttpRemoteServer
+ import com.atharok.btremote.presentation.viewmodel.AppScopeViewModel
+ import com.atharok.btremote.presentation.viewmodel.BluetoothActivationViewModel
+ import com.atharok.btremote.presentation.viewmodel.DeviceDiscoveryViewModel
+@@ -76,7 +78,14 @@ import org.koin.dsl.module
+ import java.util.Locale
+ 
+ val appModules by lazy {
+-    listOf<Module>(androidModule, viewModelModule, useCaseModule, repositoryModule, dataModule)
++    listOf<Module>(
++        androidModule,
++        viewModelModule,
++        useCaseModule,
++        repositoryModule,
++        dataModule,
++        httpModule
++    )
+ }
+ 
+ private val androidModule: Module = module {
+@@ -239,6 +248,24 @@ private val useCaseModule: Module = module {
+             dataStoreRepository = get<DataStoreRepository>()
+         )
+     }
++
++    single {
++        HttpKeyboardUseCase(
++            bluetoothRepository = get<BluetoothRepository>()
++        )
++    }
++}
++
++private val httpModule: Module = module {
++    // A process-scoped singleton, so it outlives the BluetoothHidService, which can be
++    // created and destroyed repeatedly. HttpRemoteServer.startServer() is idempotent to
++    // compensate, and stopServer() must always run from the service's onDestroy.
++    single {
++        HttpRemoteServer(
++            context = androidContext(),
++            useCase = get<HttpKeyboardUseCase>()
++        )
++    }
+ }
+ 
+ private val repositoryModule: Module = module {
+diff --git a/app/src/main/java/com/atharok/btremote/common/utils/Constants.kt b/app/src/main/java/com/atharok/btremote/common/utils/Constants.kt
+index 03fdb45..f3eac8b 100644
+--- a/app/src/main/java/com/atharok/btremote/common/utils/Constants.kt
++++ b/app/src/main/java/com/atharok/btremote/common/utils/Constants.kt
+@@ -117,4 +117,21 @@ val bluetoothHidDescriptor = byteArrayOf(
+     0x81.toByte(), 0x06.toByte(),                    //     Input (Data,Variable,Relative)
+     0xC0.toByte(),                                   //   End Collection
+     0xC0.toByte()                                    // End Collection
+-)
+\ No newline at end of file
++)
++
++// ---- HTTP remote input server (see presentation/http/) ----
++
++// Ports below 1024 require root on Android.
++const val DEFAULT_HTTP_SERVER_PORT = 8080
++
++// Upper bound on how long /key/tap will hold a key down.
++const val HTTP_MAX_HOLD_MILLIS = 10_000L
++
++// Bounds for the /key/down watchdog, which auto-releases a key the client forgot to lift.
++const val HTTP_MIN_KEYDOWN_MILLIS = 1_000L
++const val HTTP_MAX_KEYDOWN_MILLIS = 30_000L
++
++const val HTTP_MAX_CONCURRENT_REQUESTS = 8
++const val HTTP_MAX_BODY_BYTES = 4096
++const val HTTP_LOG_TAG = "BtRemoteHttp"
++const val HTTP_API_VERSION = 1
+\ No newline at end of file
+diff --git a/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKey.kt b/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKey.kt
+index ce0aecb..aeb44d8 100644
+--- a/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKey.kt
++++ b/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKey.kt
+@@ -86,5 +86,20 @@ enum class KeyboardKey(val byte: Byte) {
+     KEY_CTRL_LEFT(0x01),
+     KEY_CTRL_RIGHT(0x10),
+     KEY_ALT(0x04),
+-    KEY_ALT_GR(0x40)
++    KEY_ALT_GR(0x40),
++
++    // ---- Added for the HTTP remote input server ----
++    // These are plain keycodes on the HID keyboard/keypad usage page (0x07), not
++    // modifier bits: the descriptor only declares usages 0xE0-0xE7 as the eight
++    // variable modifier bits, so anything below 0xE0 belongs in the keycode slot.
++    KEY_CAPS_LOCK(0x39),
++    KEY_SCROLL_LOCK(0x47),
++    KEY_PAUSE(0x48),
++    KEY_INSERT(0x49),
++    KEY_HOME(0x4A),
++    // Note: KEY_DELETE (0x2A) above is forward-delete's counterpart, i.e. BACKSPACE.
++    // 0x4C is the real "Delete Forward".
++    KEY_DELETE_FORWARD(0x4C),
++    KEY_END(0x4D),
++    KEY_MENU(0x65)
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKeyNames.kt b/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKeyNames.kt
+new file mode 100644
+index 0000000..047048a
+--- /dev/null
++++ b/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKeyNames.kt
+@@ -0,0 +1,156 @@
++package com.atharok.btremote.domain.entities.remoteInput.keyboard
++
++import java.util.Locale
++
++/**
++ * Maps the readable key names used by the embedded HTTP API onto [KeyboardKey].
++ *
++ * [KeyboardKey] is named positionally - `ROW_3_KEY_00` is the physical `a` key - so an
++ * explicit table is the only honest way to expose stable, semantic names on the wire.
++ *
++ * The eight modifier members of [KeyboardKey] (`KEY_CTRL_LEFT` .. `KEY_META_RIGHT`) are
++ * deliberately absent from [byName]: their `byte` is a *bit* in the HID keyboard modifier
++ * bitmap, not a keycode. Sending one of them in the keycode slot would emit HID usage
++ * 0x01 (Keyboard ErrorRollOver). They are reachable only through [modifierBit].
++ */
++object KeyboardKeyNames {
++
++    private val byName: Map<String, KeyboardKey> = buildMap {
++        fun alias(key: KeyboardKey, vararg names: String) {
++            names.forEach { put(it, key) }
++        }
++
++        // ---- Row 1: digits and their shifted counterparts ----
++        alias(KeyboardKey.ROW_1_KEY_00, "`", "GRAVE", "BACKTICK", "TILDE")
++        alias(KeyboardKey.ROW_1_KEY_01, "1", "ONE")
++        alias(KeyboardKey.ROW_1_KEY_02, "2", "TWO")
++        alias(KeyboardKey.ROW_1_KEY_03, "3", "THREE")
++        alias(KeyboardKey.ROW_1_KEY_04, "4", "FOUR")
++        alias(KeyboardKey.ROW_1_KEY_05, "5", "FIVE")
++        alias(KeyboardKey.ROW_1_KEY_06, "6", "SIX")
++        alias(KeyboardKey.ROW_1_KEY_07, "7", "SEVEN")
++        alias(KeyboardKey.ROW_1_KEY_08, "8", "EIGHT")
++        alias(KeyboardKey.ROW_1_KEY_09, "9", "NINE")
++        alias(KeyboardKey.ROW_1_KEY_10, "0", "ZERO")
++        alias(KeyboardKey.ROW_1_KEY_11, "-", "MINUS", "HYPHEN")
++        alias(KeyboardKey.ROW_1_KEY_12, "=", "EQUALS", "EQUAL")
++
++        // ---- Row 2 ----
++        alias(KeyboardKey.ROW_2_KEY_00, "Q")
++        alias(KeyboardKey.ROW_2_KEY_01, "W")
++        alias(KeyboardKey.ROW_2_KEY_02, "E")
++        alias(KeyboardKey.ROW_2_KEY_03, "R")
++        alias(KeyboardKey.ROW_2_KEY_04, "T")
++        alias(KeyboardKey.ROW_2_KEY_05, "Y")
++        alias(KeyboardKey.ROW_2_KEY_06, "U")
++        alias(KeyboardKey.ROW_2_KEY_07, "I")
++        alias(KeyboardKey.ROW_2_KEY_08, "O")
++        alias(KeyboardKey.ROW_2_KEY_09, "P")
++        alias(KeyboardKey.ROW_2_KEY_10, "[", "LBRACKET", "LEFTBRACKET")
++        alias(KeyboardKey.ROW_2_KEY_11, "]", "RBRACKET", "RIGHTBRACKET")
++
++        // ---- Row 3 ----
++        alias(KeyboardKey.ROW_3_KEY_00, "A")
++        alias(KeyboardKey.ROW_3_KEY_01, "S")
++        alias(KeyboardKey.ROW_3_KEY_02, "D")
++        alias(KeyboardKey.ROW_3_KEY_03, "F")
++        alias(KeyboardKey.ROW_3_KEY_04, "G")
++        alias(KeyboardKey.ROW_3_KEY_05, "H")
++        alias(KeyboardKey.ROW_3_KEY_06, "J")
++        alias(KeyboardKey.ROW_3_KEY_07, "K")
++        alias(KeyboardKey.ROW_3_KEY_08, "L")
++        alias(KeyboardKey.ROW_3_KEY_09, ";", "SEMICOLON")
++        alias(KeyboardKey.ROW_3_KEY_10, "'", "APOSTROPHE", "QUOTE", "SINGLEQUOTE")
++        alias(KeyboardKey.ROW_3_KEY_11, "\\", "BACKSLASH")
++
++        // ---- Row 4 ----
++        // 0x64 is the non-US backslash / pipe key (OEM_102), not the same as 0x31 above.
++        alias(KeyboardKey.ROW_4_KEY_00, "INTL_BACKSLASH", "OEM_102", "<")
++        alias(KeyboardKey.ROW_4_KEY_01, "Z")
++        alias(KeyboardKey.ROW_4_KEY_02, "X")
++        alias(KeyboardKey.ROW_4_KEY_03, "C")
++        alias(KeyboardKey.ROW_4_KEY_04, "V")
++        alias(KeyboardKey.ROW_4_KEY_05, "B")
++        alias(KeyboardKey.ROW_4_KEY_06, "N")
++        alias(KeyboardKey.ROW_4_KEY_07, "M")
++        alias(KeyboardKey.ROW_4_KEY_08, ",", "COMMA")
++        alias(KeyboardKey.ROW_4_KEY_09, ".", "PERIOD", "DOT")
++        alias(KeyboardKey.ROW_4_KEY_10, "/", "SLASH")
++
++        // ---- Function keys ----
++        alias(KeyboardKey.KEY_F1, "F1")
++        alias(KeyboardKey.KEY_F2, "F2")
++        alias(KeyboardKey.KEY_F3, "F3")
++        alias(KeyboardKey.KEY_F4, "F4")
++        alias(KeyboardKey.KEY_F5, "F5")
++        alias(KeyboardKey.KEY_F6, "F6")
++        alias(KeyboardKey.KEY_F7, "F7")
++        alias(KeyboardKey.KEY_F8, "F8")
++        alias(KeyboardKey.KEY_F9, "F9")
++        alias(KeyboardKey.KEY_F10, "F10")
++        alias(KeyboardKey.KEY_F11, "F11")
++        alias(KeyboardKey.KEY_F12, "F12")
++        alias(KeyboardKey.KEY_PRINT_SCREEN, "PRINTSCREEN", "PRINT_SCREEN", "PRTSC")
++
++        // ---- Editing and navigation ----
++        alias(KeyboardKey.KEY_ENTER, "ENTER", "RETURN")
++        alias(KeyboardKey.KEY_ESCAPE, "ESC", "ESCAPE")
++        // KEY_DELETE holds 0x2A, which on the HID usage page is BACKSPACE. Do not alias
++        // "DELETE" to it: a client asking for delete would silently get backspace.
++        alias(KeyboardKey.KEY_DELETE, "BACKSPACE", "BKSP")
++        alias(KeyboardKey.KEY_TAB, "TAB")
++        alias(KeyboardKey.KEY_SPACE_BAR, "SPACE", "SPACEBAR", " ")
++        alias(KeyboardKey.KEY_LEFT_ARROW, "LEFT", "LEFTARROW")
++        alias(KeyboardKey.KEY_RIGHT_ARROW, "RIGHT", "RIGHTARROW")
++        alias(KeyboardKey.KEY_UP_ARROW, "UP", "UPARROW")
++        alias(KeyboardKey.KEY_DOWN_ARROW, "DOWN", "DOWNARROW")
++        alias(KeyboardKey.KEY_PAGE_UP, "PAGEUP", "PAGE_UP", "PGUP")
++        alias(KeyboardKey.KEY_PAGE_DOWN, "PAGEDOWN", "PAGE_DOWN", "PGDN")
++
++        // ---- Added to KeyboardKey for this API ----
++        alias(KeyboardKey.KEY_CAPS_LOCK, "CAPSLOCK", "CAPS_LOCK", "CAPS")
++        alias(KeyboardKey.KEY_SCROLL_LOCK, "SCROLLLOCK", "SCROLL_LOCK")
++        alias(KeyboardKey.KEY_PAUSE, "PAUSE", "BREAK")
++        alias(KeyboardKey.KEY_INSERT, "INSERT", "INS")
++        alias(KeyboardKey.KEY_HOME, "HOME")
++        alias(KeyboardKey.KEY_DELETE_FORWARD, "DELETE", "DEL", "FORWARDDELETE")
++        alias(KeyboardKey.KEY_END, "END")
++        alias(KeyboardKey.KEY_MENU, "MENU", "APP", "APPLICATION")
++    }
++
++    private val modifiersByName: Map<String, Byte> = mapOf(
++        "CTRL" to KeyboardKey.KEY_CTRL_LEFT.byte,
++        "CONTROL" to KeyboardKey.KEY_CTRL_LEFT.byte,
++        "LCTRL" to KeyboardKey.KEY_CTRL_LEFT.byte,
++        "SHIFT" to KeyboardKey.KEY_SHIFT_LEFT.byte,
++        "LSHIFT" to KeyboardKey.KEY_SHIFT_LEFT.byte,
++        "ALT" to KeyboardKey.KEY_ALT.byte,
++        "LALT" to KeyboardKey.KEY_ALT.byte,
++        "OPTION" to KeyboardKey.KEY_ALT.byte,
++        "META" to KeyboardKey.KEY_META_LEFT.byte,
++        "GUI" to KeyboardKey.KEY_META_LEFT.byte,
++        "SUPER" to KeyboardKey.KEY_META_LEFT.byte,
++        "CMD" to KeyboardKey.KEY_META_LEFT.byte,
++        "COMMAND" to KeyboardKey.KEY_META_LEFT.byte,
++        "WIN" to KeyboardKey.KEY_META_LEFT.byte,
++        "WINDOWS" to KeyboardKey.KEY_META_LEFT.byte,
++        "RCTRL" to KeyboardKey.KEY_CTRL_RIGHT.byte,
++        "RSHIFT" to KeyboardKey.KEY_SHIFT_RIGHT.byte,
++        "RALT" to KeyboardKey.KEY_ALT_GR.byte,
++        "ALTGR" to KeyboardKey.KEY_ALT_GR.byte,
++        "RMETA" to KeyboardKey.KEY_META_RIGHT.byte
++    )
++
++    /** Resolves a key name, or null when it is unknown (case-insensitive). */
++    fun lookup(name: String): KeyboardKey? = byName[normalize(name)]
++
++    /** Resolves a modifier name to its modifier bitmap bit, or null when unknown. */
++    fun modifierBit(name: String): Byte? = modifiersByName[normalize(name)]
++
++    /**
++     * Uppercases with [Locale.ROOT]. [com.atharok.btremote.data.bluetooth.BluetoothHidCore]
++     * uses `Locale.getDefault()` for MAC addresses; copying that here would break every key
++     * name containing an `i` under a Turkish locale ("i" uppercases to "İ").
++     */
++    private fun normalize(name: String): String = name.trim().uppercase(Locale.ROOT)
++}
+diff --git a/app/src/main/java/com/atharok/btremote/domain/usecases/HttpKeyboardUseCase.kt b/app/src/main/java/com/atharok/btremote/domain/usecases/HttpKeyboardUseCase.kt
+new file mode 100644
+index 0000000..5a7e848
+--- /dev/null
++++ b/app/src/main/java/com/atharok/btremote/domain/usecases/HttpKeyboardUseCase.kt
+@@ -0,0 +1,182 @@
++package com.atharok.btremote.domain.usecases
++
++import android.bluetooth.BluetoothProfile
++import com.atharok.btremote.common.utils.DELAY_BETWEEN_KEY_PRESSES_IN_MILLIS
++import com.atharok.btremote.common.utils.HTTP_MAX_HOLD_MILLIS
++import com.atharok.btremote.common.utils.HTTP_MAX_KEYDOWN_MILLIS
++import com.atharok.btremote.common.utils.HTTP_MIN_KEYDOWN_MILLIS
++import com.atharok.btremote.common.utils.KEYBOARD_REPORT_ID
++import com.atharok.btremote.common.utils.REMOTE_INPUT_NONE
++import com.atharok.btremote.domain.entities.DeviceHidConnectionState
++import com.atharok.btremote.domain.entities.remoteInput.keyboard.KeyboardKey
++import com.atharok.btremote.domain.repositories.BluetoothRepository
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++
++/** Outcome of an HTTP-driven keyboard operation, independent of any transport. */
++sealed interface KeyResult {
++
++    /** [released] is false when `keyUp` found nothing held - that is not an error. */
++    data class Ok(val released: Boolean = true) : KeyResult
++
++    data object NotConnected : KeyResult
++
++    data object AlreadyDown : KeyResult
++
++    data object WriteFailed : KeyResult
++}
++
++/**
++ * Serialises HTTP-driven keyboard input onto the single HID keyboard report channel.
++ *
++ * The keyboard HID descriptor declares exactly one non-modifier keycode slot (see
++ * [com.atharok.btremote.common.utils.bluetoothHidDescriptor]), so only one key can ever be
++ * held at a time. That constraint is modelled honestly here: a [Mutex] guards both the
++ * session state ([held]) and the whole duration of a long press, so requests queue instead
++ * of interleaving their press/release reports.
++ *
++ * The lock deliberately lives here rather than in
++ * [com.atharok.btremote.data.bluetooth.BluetoothHidCore.sendReport], which is a non-suspend
++ * blocking call shared with the on-screen UI and the notification receiver.
++ *
++ * Free of any HTTP/JSON/NanoHTTPD dependency, so it can be unit tested without a socket.
++ */
++class HttpKeyboardUseCase(
++    private val bluetoothRepository: BluetoothRepository
++) {
++
++    private val mutex = Mutex()
++
++    /** The non-modifier key currently held by the HTTP session. Guarded by [mutex]. */
++    private var held: KeyboardKey? = null
++
++    private var watchdog: Job? = null
++
++    /** Process-lifetime scope, so the watchdog outlives an individual cancelled request. */
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++
++    init {
++        // A Bluetooth drop while a key is held would otherwise leave `held` set and make
++        // every later request fail with AlreadyDown.
++        scope.launch {
++            bluetoothRepository.getDeviceHidConnectionState()
++                .map { it.state }
++                .distinctUntilChanged()
++                .collect { state ->
++                    if (state != BluetoothProfile.STATE_CONNECTED) releaseAll()
++                }
++        }
++    }
++
++    fun connectionState(): DeviceHidConnectionState =
++        bluetoothRepository.getDeviceHidConnectionState().value
++
++    fun isConnected(): Boolean = connectionState().state == BluetoothProfile.STATE_CONNECTED
++
++    fun deviceName(): String = connectionState().deviceName
++
++    /**
++     * Presses [key] with [modifiers], holds it for [holdMillis], then releases it.
++     *
++     * A zero (or tiny) hold is clamped up to the pacing the app already uses when sending
++     * text, because some hosts drop presses that are too short. Holding a key down makes the
++     * *host* auto-repeat it; no repeated reports are sent from here.
++     */
++    suspend fun tap(key: KeyboardKey, modifiers: Byte, holdMillis: Long): KeyResult =
++        mutex.withLock {
++            if (!isConnected()) return KeyResult.NotConnected
++            if (held != null) return KeyResult.AlreadyDown
++            if (!write(pressReport(key, modifiers))) return KeyResult.WriteFailed
++
++            held = key
++            try {
++                delay(holdMillis.coerceIn(DELAY_BETWEEN_KEY_PRESSES_IN_MILLIS, HTTP_MAX_HOLD_MILLIS))
++                KeyResult.Ok()
++            } finally {
++                // write() is not a suspend function, so this runs even when delay() is
++                // cancelled. A key cannot be left stuck on this path.
++                write(REMOTE_INPUT_NONE)
++                held = null
++            }
++        }
++
++    /**
++     * Presses [key] and leaves it held until [keyUp] or [releaseAll].
++     *
++     * The lock is only held for the state transition, not for the caller-controlled hold.
++     * [held] then acts as the interlock: a second [keyDown] or a [tap] both see it and are
++     * refused. [timeoutMillis] arms a watchdog that releases the key if the client vanishes.
++     */
++    suspend fun keyDown(key: KeyboardKey, modifiers: Byte, timeoutMillis: Long): KeyResult =
++        mutex.withLock {
++            if (!isConnected()) return KeyResult.NotConnected
++            if (held != null) return KeyResult.AlreadyDown
++            if (!write(pressReport(key, modifiers))) return KeyResult.WriteFailed
++
++            held = key
++            armWatchdog(key, timeoutMillis)
++            KeyResult.Ok()
++        }
++
++    /** Releases the key held by [keyDown], if any. Idempotent. */
++    suspend fun keyUp(): KeyResult = mutex.withLock {
++        cancelWatchdog()
++        if (held == null) return KeyResult.Ok(released = false)
++
++        write(REMOTE_INPUT_NONE)
++        held = null
++        KeyResult.Ok(released = true)
++    }
++
++    /**
++     * Lifts whatever is held and disarms the watchdog. The recovery hatch for a client that
++     * died mid-`keyDown`, and the teardown path when the service stops.
++     */
++    suspend fun releaseAll() {
++        mutex.withLock {
++            cancelWatchdog()
++            held = null
++            write(REMOTE_INPUT_NONE)
++        }
++    }
++
++    // ---- Internals ----
++
++    /** A keyboard report is exactly two bytes: modifier bitmap, then one keycode. */
++    private fun pressReport(key: KeyboardKey, modifiers: Byte): ByteArray =
++        byteArrayOf(modifiers, key.byte)
++
++    /**
++     * Note: [REMOTE_INPUT_NONE] is shared with the consumer/remote report. Reusing the same
++     * instance is safe because sendReport marshals it through the binder, exactly as
++     * BluetoothHidCore.sendTextReport already relies on. Never write into it.
++     */
++    private fun write(report: ByteArray): Boolean =
++        bluetoothRepository.sendReport(KEYBOARD_REPORT_ID, report)
++
++    private fun armWatchdog(key: KeyboardKey, timeoutMillis: Long) {
++        cancelWatchdog()
++        watchdog = scope.launch {
++            delay(timeoutMillis.coerceIn(HTTP_MIN_KEYDOWN_MILLIS, HTTP_MAX_KEYDOWN_MILLIS))
++            mutex.withLock {
++                if (held == key) {
++                    write(REMOTE_INPUT_NONE)
++                    held = null
++                }
++            }
++        }
++    }
++
++    private fun cancelWatchdog() {
++        watchdog?.cancel()
++        watchdog = null
++    }
++}
+diff --git a/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
+new file mode 100644
+index 0000000..0a5574f
+--- /dev/null
++++ b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
+@@ -0,0 +1,428 @@
++package com.atharok.btremote.presentation.http
++
++import android.content.Context
++import android.util.Log
++import com.atharok.btremote.common.utils.DEFAULT_HTTP_SERVER_PORT
++import com.atharok.btremote.common.utils.DELAY_BETWEEN_KEY_PRESSES_IN_MILLIS
++import com.atharok.btremote.common.utils.HTTP_API_VERSION
++import com.atharok.btremote.common.utils.HTTP_LOG_TAG
++import com.atharok.btremote.common.utils.HTTP_MAX_BODY_BYTES
++import com.atharok.btremote.common.utils.HTTP_MAX_CONCURRENT_REQUESTS
++import com.atharok.btremote.common.utils.HTTP_MAX_HOLD_MILLIS
++import com.atharok.btremote.common.utils.HTTP_MAX_KEYDOWN_MILLIS
++import com.atharok.btremote.common.utils.HTTP_MIN_KEYDOWN_MILLIS
++import com.atharok.btremote.domain.entities.remoteInput.keyboard.KeyboardKeyNames
++import com.atharok.btremote.domain.usecases.HttpKeyboardUseCase
++import com.atharok.btremote.domain.usecases.KeyResult
++import fi.iki.elonen.NanoHTTPD
++import fi.iki.elonen.NanoHTTPD.IHTTPSession
++import fi.iki.elonen.NanoHTTPD.Method
++import fi.iki.elonen.NanoHTTPD.Response
++import fi.iki.elonen.NanoHTTPD.Response.Status
++import kotlinx.coroutines.runBlocking
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.JsonArray
++import kotlinx.serialization.json.JsonNull
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.JsonObjectBuilder
++import kotlinx.serialization.json.JsonPrimitive
++import kotlinx.serialization.json.buildJsonArray
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.contentOrNull
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.longOrNull
++import kotlinx.serialization.json.put
++import java.io.IOException
++import java.util.concurrent.atomic.AtomicInteger
++
++/**
++ * An embedded HTTP microservice that turns keyboard input into HID reports on the paired host.
++ *
++ * Scope is deliberately keyboard-only. There is no mouse, no bulk text and no consumer/media
++ * key endpoint; the on-screen UI already covers those.
++ *
++ * ### Why there is no CORS header here
++ * The server is unauthenticated and bound to 0.0.0.0, so the only thing standing between a
++ * malicious web page and the paired host is the browser's same-origin policy. Cross-origin
++ * `application/json` requests trigger a preflight, which fails because no CORS headers are
++ * sent. Adding `Access-Control-Allow-Origin: *` would hand that protection away. For the same
++ * reason [isJsonRequest] rejects the CORS-safelisted content types (`text/plain`,
++ * `application/x-www-form-urlencoded`), which a form or `fetch` could otherwise send
++ * cross-origin without a preflight.
++ *
++ * ### Limits inherited from the HID descriptor
++ * The keyboard report is two bytes (modifier bitmap + one keycode), so only one non-modifier
++ * key can be held at a time and modifiers cannot change while a key is held.
++ */
++class HttpRemoteServer(
++    private val context: Context,
++    private val useCase: HttpKeyboardUseCase,
++    private val port: Int = DEFAULT_HTTP_SERVER_PORT
++) : NanoHTTPD(port) {
++
++    private val json = Json { ignoreUnknownKeys = true }
++
++    /** NanoHTTPD's async runner spawns a thread per request with no cap of its own. */
++    private val inFlight = AtomicInteger(0)
++
++    /**
++     * Tracked here because NanoHTTPD's `stop()` does not clear `myServerSocket`/`myThread`,
++     * so `wasStarted()` keeps returning true after a stop and cannot be used for idempotency.
++     */
++    @Volatile
++    private var running = false
++
++    // ---- Lifecycle ----
++
++    /**
++     * Binds the listening socket. Idempotent: a no-op while already running, so it is safe to
++     * call from every [com.atharok.btremote.presentation.services.BluetoothHidService] start.
++     *
++     * A bind failure is logged and swallowed - the Bluetooth remote must keep working without
++     * the HTTP API.
++     *
++     * @return the bound port, or null when the server could not be started.
++     */
++    fun startServer(): Int? {
++        if (running) return listeningPort
++
++        // NanoHTTPD's DefaultTempFileManager does `new File(System.getProperty("java.io.tmpdir"))`
++        // per connection; a null value throws inside a NanoHTTPD thread. We never call
++        // parseBody() so the temp file manager should stay idle, but the property is cheap
++        // insurance. NanoHTTPD's start() already sets SO_REUSEADDR itself.
++        if (System.getProperty("java.io.tmpdir") == null) {
++            System.setProperty("java.io.tmpdir", context.cacheDir.absolutePath)
++            Log.i(HTTP_LOG_TAG, "java.io.tmpdir was unset, defaulted to ${context.cacheDir.absolutePath}")
++        }
++
++        return try {
++            start()
++            running = true
++            Log.i(HTTP_LOG_TAG, "HTTP remote input server listening on port $listeningPort")
++            listeningPort
++        } catch (e: IOException) {
++            Log.e(HTTP_LOG_TAG, "HTTP server could not bind port $port", e)
++            null
++        }
++    }
++
++    /** Closes the socket. Safe to call when never started, and safe to call twice. */
++    fun stopServer() {
++        if (!running) return
++        running = false
++        try {
++            stop()
++            Log.i(HTTP_LOG_TAG, "HTTP remote input server stopped")
++        } catch (e: Exception) {
++            Log.w(HTTP_LOG_TAG, "Ignoring failure while stopping HTTP server", e)
++        }
++    }
++
++    // ---- Request entry point ----
++
++    override fun serve(session: IHTTPSession): Response {
++        // Catching Throwable is deliberate. NanoHTTPD's ClientHandler catches Exception, so an
++        // Error subclass (StackOverflowError, NoClassDefFoundError) would otherwise reach the
++        // thread's uncaught handler and kill the process. Just as importantly, NanoHTTPD logs
++        // through java.util.logging, which goes nowhere on Android - without this the failure
++        // would be completely invisible. A 500 in a response body always means this fired.
++        return try {
++            dispatch(session)
++        } catch (t: Throwable) {
++            Log.e(HTTP_LOG_TAG, "Unhandled failure serving ${session.method} ${session.uri}", t)
++            jsonResponse(Status.INTERNAL_ERROR, errorBody("internal_error", null))
++        }
++    }
++
++    private fun dispatch(session: IHTTPSession): Response {
++        if (inFlight.incrementAndGet() > HTTP_MAX_CONCURRENT_REQUESTS) {
++            inFlight.decrementAndGet()
++            return jsonResponse(
++                Status.SERVICE_UNAVAILABLE,
++                errorBody("busy", "More than $HTTP_MAX_CONCURRENT_REQUESTS requests in flight")
++            )
++        }
++        return try {
++            route(session)
++        } finally {
++            inFlight.decrementAndGet()
++        }
++    }
++
++    // ---- Routing ----
++
++    private fun route(session: IHTTPSession): Response {
++        val uri = session.uri.trimEnd('/').ifEmpty { "/" }
++        return when (uri) {
++            "/" -> if (session.method == Method.GET) indexResponse() else methodNotAllowed()
++            "/status" -> if (session.method == Method.GET) statusResponse() else methodNotAllowed()
++            "/key/tap" -> ifPost(session) { handleTap(it) }
++            "/key/down" -> ifPost(session) { handleDown(it) }
++            "/key/up" -> ifPost(session) { handleUp(it) }
++            "/key/release_all" -> ifPost(session) { handleReleaseAll() }
++            else -> jsonResponse(Status.NOT_FOUND, errorBody("not_found", "Unknown path: $uri"))
++        }
++    }
++
++    private inline fun ifPost(session: IHTTPSession, handler: (IHTTPSession) -> Response): Response =
++        when {
++            session.method != Method.POST -> methodNotAllowed()
++            !isJsonRequest(session) -> unsupportedMediaTypeResponse()
++            else -> handler(session)
++        }
++
++    // ---- Endpoints ----
++
++    private fun indexResponse(): Response = jsonResponse(
++        Status.OK,
++        buildJsonObject {
++            put("ok", true)
++            put("apiVersion", HTTP_API_VERSION)
++            put(
++                "endpoints",
++                buildJsonArray {
++                    add(JsonPrimitive("GET /status"))
++                    add(JsonPrimitive("POST /key/tap"))
++                    add(JsonPrimitive("POST /key/down"))
++                    add(JsonPrimitive("POST /key/up"))
++                    add(JsonPrimitive("POST /key/release_all"))
++                }
++            )
++        }.toString()
++    )
++
++    /** Always 200, even when no host is connected - it reports state rather than acting on it. */
++    private fun statusResponse(): Response = jsonResponse(
++        Status.OK,
++        buildJsonObject {
++            put("ok", true)
++            put("hidConnected", useCase.isConnected())
++            put("deviceName", useCase.deviceName())
++            put("state", useCase.connectionState().state)
++            put("port", listeningPort)
++            put("apiVersion", HTTP_API_VERSION)
++        }.toString()
++    )
++
++    /** Tap and long-press. `hold` is clamped; holding the key makes the host auto-repeat it. */
++    private fun handleTap(session: IHTTPSession): Response {
++        val body = readBody(session) ?: return tooLargeResponse()
++        val obj = parseObject(body) ?: return badJsonResponse()
++
++        val keyName = obj.stringField("key")
++            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("missing_key", "Field 'key' is required"))
++        val key = KeyboardKeyNames.lookup(keyName)
++            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_key", "Unknown key: $keyName"))
++        val modifiers = obj.modifierMask()
++            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_modifier", "Unrecognised entry in 'modifiers'"))
++
++        val requestedHold = obj.longField("hold") ?: 0L
++        val effectiveHold =
++            requestedHold.coerceIn(DELAY_BETWEEN_KEY_PRESSES_IN_MILLIS, HTTP_MAX_HOLD_MILLIS)
++
++        val result = runBlocking { useCase.tap(key, modifiers, requestedHold) }
++        return resultResponse(result) {
++            put("key", keyName)
++            put("hold", effectiveHold)
++        }
++    }
++
++    /** Press and leave held until `/key/up`. `timeout` arms the auto-release watchdog. */
++    private fun handleDown(session: IHTTPSession): Response {
++        val body = readBody(session) ?: return tooLargeResponse()
++        val obj = parseObject(body) ?: return badJsonResponse()
++
++        val keyName = obj.stringField("key")
++            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("missing_key", "Field 'key' is required"))
++        val key = KeyboardKeyNames.lookup(keyName)
++            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_key", "Unknown key: $keyName"))
++        val modifiers = obj.modifierMask()
++            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_modifier", "Unrecognised entry in 'modifiers'"))
++
++        val requestedTimeout = obj.longField("timeout") ?: HTTP_MAX_KEYDOWN_MILLIS
++        val effectiveTimeout =
++            requestedTimeout.coerceIn(HTTP_MIN_KEYDOWN_MILLIS, HTTP_MAX_KEYDOWN_MILLIS)
++
++        val result = runBlocking { useCase.keyDown(key, modifiers, requestedTimeout) }
++        return resultResponse(result) {
++            put("key", keyName)
++            put("autoReleaseInMillis", effectiveTimeout)
++        }
++    }
++
++    /** Releases the key held by `/key/down`. Idempotent: nothing held is not an error. */
++    private fun handleUp(session: IHTTPSession): Response {
++        val text = readBody(session) ?: return tooLargeResponse()
++        if (text.isNotBlank() && parseObject(text) == null) return badJsonResponse()
++
++        val result = runBlocking { useCase.keyUp() }
++        return when (result) {
++            is KeyResult.Ok -> jsonResponse(
++                Status.OK,
++                buildJsonObject {
++                    put("ok", true)
++                    put("released", result.released)
++                }.toString()
++            )
++            else -> resultResponse(result) {}
++        }
++    }
++
++    /** Recovery hatch for a client that died mid-hold, so the host can never stay stuck. */
++    private fun handleReleaseAll(): Response {
++        runBlocking { useCase.releaseAll() }
++        return jsonResponse(
++            Status.OK,
++            buildJsonObject { put("ok", true) }.toString()
++        )
++    }
++
++    // ---- Result / error mapping ----
++
++    private fun resultResponse(
++        result: KeyResult,
++        successBody: JsonObjectBuilder.() -> Unit
++    ): Response = when (result) {
++        is KeyResult.Ok -> jsonResponse(
++            Status.OK,
++            buildJsonObject {
++                put("ok", true)
++                successBody()
++            }.toString()
++        )
++
++        KeyResult.NotConnected -> jsonResponse(
++            Status.CONFLICT,
++            errorBody("not_connected", "No Bluetooth HID host is connected")
++        )
++
++        KeyResult.AlreadyDown -> jsonResponse(
++            Status.CONFLICT,
++            errorBody("key_already_down", "A key is already held; release it with /key/up first")
++        )
++
++        KeyResult.WriteFailed -> jsonResponse(
++            HID_WRITE_FAILED,
++            errorBody("hid_write_failed", "The HID report could not be sent")
++        )
++    }
++
++    // ---- Request body ----
++
++    /**
++     * Reads the raw body straight off the socket using `content-length`.
++     *
++     * Returns the body text (empty string when there is none), or null when the client
++     * declared more than [HTTP_MAX_BODY_BYTES].
++     *
++     * `IHTTPSession.parseBody()` is deliberately avoided: it routes through NanoHTTPD's temp
++     * file manager, which touches `java.io.tmpdir`. NanoHTTPD positions the stream at the
++     * first body byte before calling serve(), so a manual read is exact - which also keeps
++     * keep-alive connections in sync, since a dropped byte would desync the next request.
++     */
++    private fun readBody(session: IHTTPSession): String? {
++        val declared = session.headers["content-length"]?.trim()?.toIntOrNull() ?: 0
++        if (declared <= 0) return ""
++        if (declared > HTTP_MAX_BODY_BYTES) return null
++
++        val buffer = ByteArray(declared)
++        var offset = 0
++        val input = session.inputStream
++        while (offset < declared) {
++            val read = input.read(buffer, offset, declared - offset)
++            if (read < 0) break
++            offset += read
++        }
++        return String(buffer, 0, offset, Charsets.UTF_8)
++    }
++
++    private fun parseObject(text: String): JsonObject? {
++        if (text.isBlank()) return JsonObject(emptyMap())
++        return try {
++            json.parseToJsonElement(text).jsonObject
++        } catch (e: Exception) {
++            // Covers both malformed JSON (SerializationException) and valid JSON that is not
++            // an object (IllegalArgumentException). Neither reaches the caller as a throw.
++            Log.d(HTTP_LOG_TAG, "Rejected request body: ${e.message}")
++            null
++        }
++    }
++
++    private fun JsonObject.stringField(name: String): String? =
++        (this[name] as? JsonPrimitive)?.contentOrNull
++
++    private fun JsonObject.longField(name: String): Long? =
++        (this[name] as? JsonPrimitive)?.longOrNull
++
++    /** ORs the named modifiers into the HID modifier bitmap, or null when a name is unknown. */
++    private fun JsonObject.modifierMask(): Byte? {
++        val element = this["modifiers"] ?: return 0
++        // Treat an explicit null the same as an absent list rather than as a bad request.
++        if (element is JsonNull) return 0
++
++        val array = element as? JsonArray ?: return null
++        var mask = 0
++        for (item in array) {
++            val name = (item as? JsonPrimitive)?.contentOrNull ?: return null
++            val bit = KeyboardKeyNames.modifierBit(name) ?: return null
++            mask = mask or bit.toInt()
++        }
++        return mask.toByte()
++    }
++
++    /**
++     * Rejects the CORS-safelisted content types. A cross-origin `fetch` or form post can send
++     * `text/plain` or `application/x-www-form-urlencoded` without a preflight; only
++     * `application/json` is forced through one, and with no CORS headers that preflight fails.
++     */
++    private fun isJsonRequest(session: IHTTPSession): Boolean {
++        val contentType = session.headers["content-type"] ?: return true
++        return contentType.contains("json", ignoreCase = true)
++    }
++
++    // ---- Response helpers ----
++
++    private fun jsonResponse(status: Response.IStatus, body: String): Response =
++        NanoHTTPD.newFixedLengthResponse(status, JSON_MIME, body)
++
++    private fun errorBody(code: String, message: String?): String =
++        buildJsonObject {
++            put("ok", false)
++            put("error", code)
++            if (message != null) put("message", message)
++        }.toString()
++
++    private fun badJsonResponse(): Response =
++        jsonResponse(Status.BAD_REQUEST, errorBody("bad_json", "Body must be a JSON object"))
++
++    private fun methodNotAllowed(): Response =
++        jsonResponse(
++            Status.METHOD_NOT_ALLOWED,
++            errorBody("method_not_allowed", "Use GET /status, or POST for /key/*")
++        )
++
++    private fun unsupportedMediaTypeResponse(): Response =
++        jsonResponse(
++            Status.UNSUPPORTED_MEDIA_TYPE,
++            errorBody("unsupported_media_type", "Content-Type must be application/json")
++        )
++
++    private fun tooLargeResponse(): Response =
++        jsonResponse(
++            Status.PAYLOAD_TOO_LARGE,
++            errorBody("body_too_large", "Body exceeds $HTTP_MAX_BODY_BYTES bytes")
++        ).apply {
++            // The unread remainder would desync the next keep-alive request on this socket.
++            closeConnection(true)
++        }
++
++    companion object {
++        private const val JSON_MIME = "application/json; charset=utf-8"
++
++        /** 502, which nanohttpd's own Status enum does not define. */
++        private val HID_WRITE_FAILED: Response.IStatus = object : Response.IStatus {
++            override fun getRequestStatus(): Int = 502
++            override fun getDescription(): String = "502 HID Write Failed"
++        }
++    }
++}
+diff --git a/app/src/main/java/com/atharok/btremote/presentation/services/BluetoothHidService.kt b/app/src/main/java/com/atharok/btremote/presentation/services/BluetoothHidService.kt
+index 7649c06..797d06f 100644
+--- a/app/src/main/java/com/atharok/btremote/presentation/services/BluetoothHidService.kt
++++ b/app/src/main/java/com/atharok/btremote/presentation/services/BluetoothHidService.kt
+@@ -11,13 +11,17 @@ import android.content.Context
+ import android.content.Intent
+ import android.os.Binder
+ import android.os.IBinder
++import android.util.Log
+ import android.widget.RemoteViews
+ import androidx.core.app.NotificationCompat
+ import androidx.glance.appwidget.updateAll
+ import com.atharok.btremote.R
++import com.atharok.btremote.common.utils.HTTP_LOG_TAG
+ import com.atharok.btremote.common.utils.NOTIFICATION_CHANNEL_ID
+ import com.atharok.btremote.common.utils.NOTIFICATION_ID
+ import com.atharok.btremote.domain.usecases.BluetoothHidServiceUseCase
++import com.atharok.btremote.domain.usecases.HttpKeyboardUseCase
++import com.atharok.btremote.presentation.http.HttpRemoteServer
+ import com.atharok.btremote.presentation.activities.MainActivity
+ import com.atharok.btremote.presentation.glance.MediaControlWidget
+ import com.atharok.btremote.presentation.services.NotificationBroadcastReceiver.Companion.ACTION_BACK
+@@ -38,10 +42,14 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withTimeoutOrNull
+ import org.koin.android.ext.android.inject
+ 
+ class BluetoothHidService : Service() {
+     private val useCase: BluetoothHidServiceUseCase by inject()
++    private val httpServer: HttpRemoteServer by inject()
++    private val httpKeyboardUseCase: HttpKeyboardUseCase by inject()
+     private lateinit var notificationManager: NotificationManager
+     private var job: Job? = null
+     private var currentConnectionState = STATE_DISCONNECTED
+@@ -76,10 +84,26 @@ class BluetoothHidService : Service() {
+     }
+ 
+     override fun onDestroy() {
++        // Order matters. Close the socket first so no further request can arrive, then lift any
++        // held key while the Bluetooth link is still up - sendReport() returns false once the
++        // HID profile has been torn down.
++        httpServer.stopServer()
++        releaseAllKeys()
+         stopBluetoothHidProfile()
+         super.onDestroy()
+     }
+ 
++    private fun releaseAllKeys() {
++        // Bounded, because onDestroy runs on the main thread. A /key/down in flight would
++        // already have released the lock, so this only ever waits on a live long press.
++        val released = runBlocking {
++            withTimeoutOrNull(300L) { httpKeyboardUseCase.releaseAll() }
++        }
++        if (released == null) {
++            Log.w(HTTP_LOG_TAG, "Timed out releasing held keys during shutdown")
++        }
++    }
++
+     override fun onTaskRemoved(rootIntent: Intent?) {
+         stopSelf()
+         super.onTaskRemoved(rootIntent)
+@@ -91,6 +115,8 @@ class BluetoothHidService : Service() {
+         try {
+             startForeground(NOTIFICATION_ID, createNotification())
+             startBluetoothHidProfile()
++            // Non-fatal: the Bluetooth remote keeps working if the HTTP port cannot be bound.
++            httpServer.startServer()
+         } catch (exception: Exception) {
+             stopSelf()
+         }
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 1ddb299..93342de 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -14,6 +14,7 @@ koin = "4.2.1"
+ kotlinxSerializationJson = "1.11.0"
+ glance = "1.1.1"
+ workRuntimeKtx = "2.11.2"
++nanohttpd = "2.3.1"
+ 
+ [libraries]
+ androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+@@ -38,6 +39,7 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
+ glance-appwidget = { module = "androidx.glance:glance-appwidget", version.ref = "glance" }
+ glance-material3 = { module = "androidx.glance:glance-material3", version.ref = "glance" }
+ androidx-work-runtime-ktx = { module = "androidx.work:work-runtime-ktx", version.ref = "workRuntimeKtx" }
++nanohttpd = { module = "org.nanohttpd:nanohttpd", version.ref = "nanohttpd" }
+ 
+ [plugins]
+ android-application = { id = "com.android.application", version.ref = "agp" }

@@ -170,10 +170,10 @@ index ce0aecb..aeb44d8 100644
 \ No newline at end of file
 diff --git a/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKeyNames.kt b/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKeyNames.kt
 new file mode 100644
-index 0000000..047048a
+index 0000000..2265bda
 --- /dev/null
 +++ b/app/src/main/java/com/atharok/btremote/domain/entities/remoteInput/keyboard/KeyboardKeyNames.kt
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,204 @@
 +package com.atharok.btremote.domain.entities.remoteInput.keyboard
 +
 +import java.util.Locale
@@ -191,9 +191,23 @@ index 0000000..047048a
 + */
 +object KeyboardKeyNames {
 +
-+    private val byName: Map<String, KeyboardKey> = buildMap {
++    /**
++     * A resolved key together with the modifier bits the name itself implies.
++     *
++     * Most names imply nothing, but a character that only exists behind Shift on a US layout
++     * carries that Shift with it - `"!"` resolves to Shift+`1`.
++     */
++    data class KeyStroke(val key: KeyboardKey, val modifiers: Byte)
++
++    private val byName: Map<String, KeyStroke> = buildMap {
 +        fun alias(key: KeyboardKey, vararg names: String) {
-+            names.forEach { put(it, key) }
++            names.forEach { put(it, KeyStroke(key, 0)) }
++        }
++
++        /** A character that needs Shift on a US layout, e.g. `'!'` is Shift+`1`. */
++        fun shiftAlias(key: KeyboardKey, vararg names: String) {
++            val shift = KeyboardKey.KEY_SHIFT_LEFT.byte
++            names.forEach { put(it, KeyStroke(key, shift)) }
 +        }
 +
 +        // ---- Row 1: digits and their shifted counterparts ----
@@ -240,8 +254,9 @@ index 0000000..047048a
 +        alias(KeyboardKey.ROW_3_KEY_11, "\\", "BACKSLASH")
 +
 +        // ---- Row 4 ----
-+        // 0x64 is the non-US backslash / pipe key (OEM_102), not the same as 0x31 above.
-+        alias(KeyboardKey.ROW_4_KEY_00, "INTL_BACKSLASH", "OEM_102", "<")
++        // 0x64 is the non-US backslash / pipe key (OEM_102), a different physical key from
++        // 0x31 above. It is NOT '<': on a US layout '<' is Shift+comma (ROW_4_KEY_08).
++        alias(KeyboardKey.ROW_4_KEY_00, "INTL_BACKSLASH", "OEM_102")
 +        alias(KeyboardKey.ROW_4_KEY_01, "Z")
 +        alias(KeyboardKey.ROW_4_KEY_02, "X")
 +        alias(KeyboardKey.ROW_4_KEY_03, "C")
@@ -292,6 +307,32 @@ index 0000000..047048a
 +        alias(KeyboardKey.KEY_DELETE_FORWARD, "DELETE", "DEL", "FORWARDDELETE")
 +        alias(KeyboardKey.KEY_END, "END")
 +        alias(KeyboardKey.KEY_MENU, "MENU", "APP", "APPLICATION")
++
++        // ---- Characters that only exist behind Shift on a US layout ----
++        // These mirror the mappings in EnglishUSVirtualKeyboardLayout, so the HTTP API and the
++        // on-screen keyboard agree on where each character lives.
++        shiftAlias(KeyboardKey.ROW_1_KEY_00, "~")
++        shiftAlias(KeyboardKey.ROW_1_KEY_01, "!")
++        shiftAlias(KeyboardKey.ROW_1_KEY_02, "@")
++        shiftAlias(KeyboardKey.ROW_1_KEY_03, "#")
++        shiftAlias(KeyboardKey.ROW_1_KEY_04, "$")
++        shiftAlias(KeyboardKey.ROW_1_KEY_05, "%")
++        shiftAlias(KeyboardKey.ROW_1_KEY_06, "^")
++        shiftAlias(KeyboardKey.ROW_1_KEY_07, "&")
++        shiftAlias(KeyboardKey.ROW_1_KEY_08, "*")
++        shiftAlias(KeyboardKey.ROW_1_KEY_09, "(")
++        shiftAlias(KeyboardKey.ROW_1_KEY_10, ")")
++        shiftAlias(KeyboardKey.ROW_1_KEY_11, "_")
++        shiftAlias(KeyboardKey.ROW_1_KEY_12, "+")
++        shiftAlias(KeyboardKey.ROW_2_KEY_10, "{")
++        shiftAlias(KeyboardKey.ROW_2_KEY_11, "}")
++        shiftAlias(KeyboardKey.ROW_3_KEY_09, ":")
++        // Distinct from the unshifted apostrophe aliased above.
++        shiftAlias(KeyboardKey.ROW_3_KEY_10, "\"")
++        shiftAlias(KeyboardKey.ROW_3_KEY_11, "|")
++        shiftAlias(KeyboardKey.ROW_4_KEY_08, "<")
++        shiftAlias(KeyboardKey.ROW_4_KEY_09, ">")
++        shiftAlias(KeyboardKey.ROW_4_KEY_10, "?")
 +    }
 +
 +    private val modifiersByName: Map<String, Byte> = mapOf(
@@ -317,8 +358,15 @@ index 0000000..047048a
 +        "RMETA" to KeyboardKey.KEY_META_RIGHT.byte
 +    )
 +
-+    /** Resolves a key name, or null when it is unknown (case-insensitive). */
-+    fun lookup(name: String): KeyboardKey? = byName[normalize(name)]
++    /**
++     * Resolves a key name or a shifted character, or null when unknown (case-insensitive).
++     *
++     * Note that the lookup is case-insensitive, so `"a"` and `"A"` both mean the physical A
++     * key and both produce a lowercase `a`. To get an uppercase letter, ask for Shift too:
++     * `{"key":"A","modifiers":["SHIFT"]}`. Letters are key names, not characters - only the
++     * punctuation above carries an implied Shift.
++     */
++    fun resolve(name: String): KeyStroke? = byName[normalize(name)]
 +
 +    /** Resolves a modifier name to its modifier bitmap bit, or null when unknown. */
 +    fun modifierBit(name: String): Byte? = modifiersByName[normalize(name)]
@@ -548,10 +596,10 @@ index 0000000..fbc4896
 +}
 diff --git a/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
 new file mode 100644
-index 0000000..ba2c0e9
+index 0000000..360c367
 --- /dev/null
 +++ b/app/src/main/java/com/atharok/btremote/presentation/http/HttpRemoteServer.kt
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,454 @@
 +package com.atharok.btremote.presentation.http
 +
 +import android.content.Context
@@ -768,21 +816,25 @@ index 0000000..ba2c0e9
 +        val obj = parseObject(body) ?: return badJsonResponse()
 +
 +        val keyName = obj.stringField("key")
-+        val key = keyName?.let { KeyboardKeyNames.lookup(it) }
-+        if (keyName != null && key == null) {
++        val stroke = keyName?.let { KeyboardKeyNames.resolve(it) }
++        if (keyName != null && stroke == null) {
 +            return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_key", "Unknown key: $keyName"))
 +        }
-+        val modifiers = obj.modifierMask()
++        val requested = obj.modifierMask()
 +            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_modifier", "Unrecognised entry in 'modifiers'"))
-+        if (key == null && modifiers.toInt() == 0) return emptyReportResponse()
++        val key = stroke?.key
++        // A character like '!' carries its own Shift; OR it with whatever the client asked for.
++        val modifiers = (stroke?.modifiers?.toInt() ?: 0) or requested.toInt()
++        if (key == null && modifiers == 0) return emptyReportResponse()
 +
 +        val requestedHold = obj.longField("hold") ?: 0L
 +        val effectiveHold =
 +            requestedHold.coerceIn(DELAY_BETWEEN_KEY_PRESSES_IN_MILLIS, HTTP_MAX_HOLD_MILLIS)
 +
-+        val result = runBlocking { useCase.tap(key, modifiers, requestedHold) }
++        val result = runBlocking { useCase.tap(key, modifiers.toByte(), requestedHold) }
 +        return resultResponse(result) {
 +            if (keyName != null) put("key", keyName)
++            put("modifiers", modifiers)
 +            put("hold", effectiveHold)
 +        }
 +    }
@@ -797,21 +849,24 @@ index 0000000..ba2c0e9
 +        val obj = parseObject(body) ?: return badJsonResponse()
 +
 +        val keyName = obj.stringField("key")
-+        val key = keyName?.let { KeyboardKeyNames.lookup(it) }
-+        if (keyName != null && key == null) {
++        val stroke = keyName?.let { KeyboardKeyNames.resolve(it) }
++        if (keyName != null && stroke == null) {
 +            return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_key", "Unknown key: $keyName"))
 +        }
-+        val modifiers = obj.modifierMask()
++        val requested = obj.modifierMask()
 +            ?: return jsonResponse(Status.BAD_REQUEST, errorBody("unknown_modifier", "Unrecognised entry in 'modifiers'"))
-+        if (key == null && modifiers.toInt() == 0) return emptyReportResponse()
++        val key = stroke?.key
++        val modifiers = (stroke?.modifiers?.toInt() ?: 0) or requested.toInt()
++        if (key == null && modifiers == 0) return emptyReportResponse()
 +
 +        val requestedTimeout = obj.longField("timeout") ?: HTTP_MAX_KEYDOWN_MILLIS
 +        val effectiveTimeout =
 +            requestedTimeout.coerceIn(HTTP_MIN_KEYDOWN_MILLIS, HTTP_MAX_KEYDOWN_MILLIS)
 +
-+        val result = runBlocking { useCase.keyDown(key, modifiers, requestedTimeout) }
++        val result = runBlocking { useCase.keyDown(key, modifiers.toByte(), requestedTimeout) }
 +        return resultResponse(result) {
 +            if (keyName != null) put("key", keyName)
++            put("modifiers", modifiers)
 +            put("autoReleaseInMillis", effectiveTimeout)
 +        }
 +    }
